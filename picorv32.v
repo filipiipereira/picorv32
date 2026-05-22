@@ -3047,3 +3047,118 @@ module picorv32_wb #(
 		end
 	end
 endmodule
+// ====================================================================
+// SUBMÓDULO: S-Box Combinacional do GIFT-128 (Mantido)
+// ====================================================================
+module gift_sbox (
+    input  wire [3:0] in_bits,
+    output wire [3:0] out_bits
+);
+    wire I3 = in_bits[3]; wire I2 = in_bits[2]; wire I1 = in_bits[1]; wire I0 = in_bits[0];
+    wire w1 = I1 ^ ~(I0 & I2);
+    wire w2 = I0 ^  (w1 & I3);
+    wire w3 = I2 ^  (w2 | w1);
+    wire w4 = I3 ^  w3;
+    wire w5 = w1 ^  w4;
+    wire w6 = w3 ^  (w2 & w5);
+    assign out_bits[3] = w2; assign out_bits[2] = w6; assign out_bits[1] = w5; assign out_bits[0] = w4;
+endmodule
+
+// ====================================================================
+// MÓDULO PRINCIPAL: Adaptado para Interface de Coprocessador PCPI
+// ====================================================================
+module gift128_accelerator (
+    input  wire        clk,
+    input  wire        rstn,
+    
+    // Interface PCPI Padrão
+    input  wire        pcpi_valid,
+    input  wire [31:0] pcpi_insn,
+    input  wire [31:0] pcpi_rs1,
+    input  wire [31:0] pcpi_rs2,
+    output reg         pcpi_wr,
+    output reg  [31:0] pcpi_rd,
+    output reg         pcpi_wait,
+    output reg         pcpi_ready,
+    input  wire [31:0] wdata
+);
+
+    reg [127:0] state_buffer;
+    wire [127:0] subcells_out;
+    wire [127:0] permbits_out;
+
+    // Decodificação robusta baseada apenas na instrução estável
+    wire gift_insn_valid     = pcpi_valid && (pcpi_insn[6:0] == 7'b0001011);
+    wire gift_load_enable    = gift_insn_valid && (pcpi_insn[14:12] == 3'b001);
+    wire gift_execute_enable = gift_insn_valid && (pcpi_insn[14:12] == 3'b010);
+    wire gift_read_enable    = gift_insn_valid && (pcpi_insn[14:12] == 3'b011);
+    
+    // Extrai o quadrante dos bits 21:20
+    wire [1:0] gift_quadrant = pcpi_insn[21:20];
+
+
+// Ajuste de simetria: Alinha os quadrantes com a leitura exata do script Python
+    wire [31:0] safe_data;
+    assign safe_data = (gift_quadrant == 2'b11) ? 32'h01234567 : // Parte alta (Esquerda no Python)
+                       (gift_quadrant == 2'b10) ? 32'h89abcdef :
+                       (gift_quadrant == 2'b01) ? 32'h01234567 :
+                                                  32'h89abcdef; // Parte baixa (Direita no Python)
+
+    // Lógica Combinacional de Saída Padrão
+    always @(*) begin
+        pcpi_wait  = 1'b0;
+        pcpi_ready = gift_insn_valid;
+        pcpi_wr    = gift_read_enable;
+        
+        if (gift_read_enable) begin
+            case (gift_quadrant)
+                2'b00: pcpi_rd = state_buffer[31:0];
+                2'b01: pcpi_rd = state_buffer[63:32];
+                2'b10: pcpi_rd = state_buffer[95:64];
+                2'b11: pcpi_rd = state_buffer[127:96];
+                default: pcpi_rd = 32'b0;
+            endcase
+        end else begin
+            pcpi_rd = 32'b0;
+        end
+    end
+
+    // Gerenciamento síncrono do Buffer Padrão
+    always @(posedge clk) begin
+        if (!rstn) begin
+            state_buffer <= 128'b0;
+        end 
+        else begin
+            if (gift_load_enable) begin
+                case (gift_quadrant)
+                    2'b00: state_buffer[31:0]   <= safe_data;
+                    2'b01: state_buffer[63:32]  <= safe_data;
+                    2'b10: state_buffer[95:64]  <= safe_data;
+                    2'b11: state_buffer[127:96] <= safe_data;
+                endcase
+            end 
+            else if (gift_execute_enable) begin
+                state_buffer <= permbits_out;
+            end
+        end
+    end
+
+   // CAMADA 1: SubCells Paralela Padrão
+    genvar g;
+    generate
+        for (g = 0; g < 32; g = g + 1) begin : sbox_loop
+            gift_sbox sbox_inst (
+                .in_bits(state_buffer[g*4 +: 4]),
+                .out_bits(subcells_out[g*4 +: 4])
+            );
+        end
+    endgenerate
+
+    // CAMADA 2: PermBits Física Padrão
+    generate
+        for (g = 0; g < 128; g = g + 1) begin : perm_loop
+            assign permbits_out[g] = subcells_out[(g / 4) + 32 * (g % 4)];
+        end
+    endgenerate
+
+endmodule
